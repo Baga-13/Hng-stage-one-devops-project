@@ -1,55 +1,57 @@
 #!/bin/bash
 
-
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <filename>"
-    exit 1
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
 fi
 
-INPUT_FILE=$1
 LOG_FILE="/var/log/user_management.log"
 PASSWORD_FILE="/var/secure/user_passwords.csv"
 
-mkdir -p /var/secure
-
+# Clear previous log and password files
 > $LOG_FILE
 > $PASSWORD_FILE
 
+# Function to create user and groups
 create_user() {
-    local username=$1
-    local groups=$2
+  IFS=';' read -r username groups <<< "$1"
+  username=$(echo "$username" | xargs) # Remove whitespace
+  groups=$(echo "$groups" | xargs) # Remove whitespace
+  
+  if id "$username" &>/dev/null; then
+    echo "User $username already exists. Adding to groups..." | tee -a $LOG_FILE
+  else
+    useradd -m -s /bin/bash "$username" | tee -a $LOG_FILE
+    echo "Created user $username" | tee -a $LOG_FILE
+    password=$(openssl rand -base64 12)
+    echo "$username:$password" | chpasswd
+    echo "$username,$password" >> $PASSWORD_FILE
+  fi
 
-    if id "$username" &>/dev/null; then
-        echo "User $username already exists." | tee -a $LOG_FILE
-    else
-        useradd -m -s /bin/bash "$username"
-        groupadd "$username"
-        usermod -aG "$username" "$username"
+  # Ensure that user's personal group exists
+  if ! getent group "$username" &>/dev/null; then
+    groupadd "$username" | tee -a $LOG_FILE
+  fi
 
-      
-        IFS=',' read -ra ADDR <<< "$groups"
-        for group in "${ADDR[@]}"; do
-            groupadd "$group"
-            usermod -aG "$group" "$username"
-        done
+  usermod -aG "$username" "$username" | tee -a $LOG_FILE
 
-       
-        PASSWORD=$(openssl rand -base64 12)
-        echo "$username:$PASSWORD" | chpasswd
-
-        echo "Created user $username with groups $groups." | tee -a $LOG_FILE
-
-        echo "$username,$PASSWORD" >> $PASSWORD_FILE
-
-        chown root:root $PASSWORD_FILE
-        chmod 600 $PASSWORD_FILE
+  # Add user to specified groups
+  IFS=',' read -ra group_list <<< "$groups"
+  for group in "${group_list[@]}"; do
+    if ! getent group "$group" &>/dev/null; then
+      groupadd "$group" | tee -a $LOG_FILE
+      echo "Created group $group" | tee -a $LOG_FILE
     fi
+    usermod -aG "$group" "$username" | tee -a $LOG_FILE
+  done
 }
 
-while IFS=';' read -r username groups; do
-    username=$(echo "$username" | xargs)
-    groups=$(echo "$groups" | xargs)
-    create_user "$username" "$groups"
-done < "$INPUT_FILE"
+# Read input file and create users and groups
+while IFS= read -r line; do
+  create_user "$line"
+done < "$1"
 
-echo "User creation process completed." | tee -a $LOG_FILE
+# Set permissions for password file
+chmod 600 $PASSWORD_FILE
+chown root:root $PASSWORD_FILE
